@@ -5,15 +5,37 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from db import init_db
 
 load_dotenv()
 
-key_id = os.getenv("RAZORPAY_KEY_ID")
-key_secret = os.getenv("RAZORPAY_KEY_SECRET")
-client = razorpay.Client(auth=(key_id, key_secret))
+key_id = os.getenv("RAZORPAY_KEY_ID", "")
+key_secret = os.getenv("RAZORPAY_KEY_SECRET", "")
+client = razorpay.Client(auth=(key_id, key_secret)) if (key_id and key_secret) else None
 
-app = FastAPI()
+app = FastAPI(title="FastCommerce Engine")
 DB_NAME = "commerce.db"
+
+def seed_default_store():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM merchants WHERE slug = 'codecraft'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO merchants (store_name, slug, email, platform_fee_percent) VALUES (?, ?, ?, ?)",
+                ("CodeCraft Store", "codecraft", "support@codecraft.io", 5.0)
+            )
+            merchant_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO products (merchant_id, title, price_rupees, delivery_file_url) VALUES (?, ?, ?, ?)",
+                (merchant_id, "FastAPI Boilerplate Kit", 499, "https://github.com")
+            )
+            conn.commit()
+
+@app.on_event("startup")
+def startup():
+    init_db()
+    seed_default_store()
 
 class CreateStorePayload(BaseModel):
     store_name: str
@@ -28,44 +50,51 @@ class VerifyPaymentPayload(BaseModel):
     razorpay_signature: str
     product_id: int
 
+@app.get("/")
 @app.get("/merchant")
+@app.get("/dashboard")
+@app.get("/dashboard.html")
 def merchant_dashboard():
-    return FileResponse("dashboard.html")
+    if os.path.exists("dashboard.html"):
+        return FileResponse("dashboard.html")
+    return HTMLResponse("<h2>dashboard.html not found on server</h2>", status_code=404)
 
 @app.post("/api/create-store")
 def create_store(payload: CreateStorePayload):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO merchants (store_name, slug, email) VALUES (?, ?, ?)",
-                       (payload.store_name, payload.slug.lower(), payload.email))
-        merchant_id = cursor.lastrowid
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO merchants (store_name, slug, email) VALUES (?, ?, ?)",
+                (payload.store_name, payload.slug.lower(), payload.email)
+            )
+            merchant_id = cursor.lastrowid
 
-        cursor.execute("INSERT INTO products (merchant_id, title, price_rupees) VALUES (?, ?, ?)",
-                       (merchant_id, payload.product_title, payload.price))
-        conn.commit()
+            cursor.execute(
+                "INSERT INTO products (merchant_id, title, price_rupees) VALUES (?, ?, ?)",
+                (merchant_id, payload.product_title, payload.price)
+            )
+            conn.commit()
     except sqlite3.IntegrityError:
-        conn.close()
         raise HTTPException(status_code=400, detail="Store URL slug already taken.")
-    conn.close()
+    
     return {"store_url": f"/store/{payload.slug.lower()}"}
 
 @app.get("/store/{slug}", response_class=HTMLResponse)
 def get_store(slug: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT m.store_name, p.id, p.title, p.price_rupees, m.platform_fee_percent
-        FROM merchants m
-        JOIN products p ON m.id = p.merchant_id
-        WHERE m.slug = ?
-        LIMIT 1
-    """, (slug.lower(),))
-    row = cursor.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT m.store_name, p.id, p.title, p.price_rupees, m.platform_fee_percent
+            FROM merchants m
+            JOIN products p ON m.id = p.merchant_id
+            WHERE m.slug = ?
+            LIMIT 1
+        """, (slug.lower(),))
+        row = cursor.fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="Store not found")
+        raise HTTPException(status_code=404, detail=f"Store '{slug}' not found.")
 
     store_name, prod_id, prod_title, price, fee_percent = row
     merchant_share = int(price * (1 - (fee_percent / 100.0)))
@@ -105,6 +134,11 @@ def get_store(slug: str):
                 const res = await fetch('/api/order/{prod_id}', {{ method: 'POST' }});
                 const data = await res.json();
                 
+                if (!res.ok) {{
+                    alert(data.detail || "Error generating order");
+                    return;
+                }}
+                
                 const rzp = new Razorpay({{
                     "key": data.key_id,
                     "amount": data.amount,
@@ -113,7 +147,6 @@ def get_store(slug: str):
                     "description": "{prod_title}",
                     "order_id": data.order_id,
                     "handler": async function(response) {{
-                        // Verify signature and fulfill order
                         const verifyRes = await fetch('/api/verify-and-fulfill', {{
                             method: 'POST',
                             headers: {{ 'Content-Type': 'application/json' }},
@@ -145,16 +178,18 @@ def get_store(slug: str):
 
 @app.post("/api/order/{product_id}")
 def create_dynamic_order(product_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT p.title, p.price_rupees, m.store_name, m.platform_fee_percent
-        FROM products p
-        JOIN merchants m ON p.merchant_id = m.id
-        WHERE p.id = ?
-    """, (product_id,))
-    row = cursor.fetchone()
-    conn.close()
+    if not client:
+        raise HTTPException(status_code=500, detail="Razorpay credentials not configured.")
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT p.title, p.price_rupees, m.store_name, m.platform_fee_percent
+            FROM products p
+            JOIN merchants m ON p.merchant_id = m.id
+            WHERE p.id = ?
+        """, (product_id,))
+        row = cursor.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -183,7 +218,9 @@ def create_dynamic_order(product_id: int):
 
 @app.post("/api/verify-and-fulfill")
 def verify_and_fulfill(payload: VerifyPaymentPayload):
-    # 1. Cryptographic Signature Verification
+    if not client:
+        raise HTTPException(status_code=500, detail="Razorpay credentials not configured.")
+
     verify_data = {
         'razorpay_order_id': payload.razorpay_order_id,
         'razorpay_payment_id': payload.razorpay_payment_id,
@@ -194,74 +231,65 @@ def verify_and_fulfill(payload: VerifyPaymentPayload):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid payment signature")
 
-    # 2. Retrieve Product Details & Delivery URL
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT p.price_rupees, p.delivery_file_url, m.platform_fee_percent
-        FROM products p
-        JOIN merchants m ON p.merchant_id = m.id
-        WHERE p.id = ?
-    """, (payload.product_id,))
-    row = cursor.fetchone()
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT p.price_rupees, COALESCE(p.delivery_file_url, 'https://github.com'), m.platform_fee_percent
+            FROM products p
+            JOIN merchants m ON p.merchant_id = m.id
+            WHERE p.id = ?
+        """, (payload.product_id,))
+        row = cursor.fetchone()
 
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Product not found")
+        if not row:
+            raise HTTPException(status_code=404, detail="Product not found")
 
-    price, delivery_url, fee_percent = row
-    platform_cut = round(price * (fee_percent / 100.0), 2)
-    merchant_share = round(price - platform_cut, 2)
+        price, delivery_url, fee_percent = row
+        platform_cut = round(price * (fee_percent / 100.0), 2)
+        merchant_share = round(price - platform_cut, 2)
 
-    # 3. Record order as paid
-    cursor.execute("""
-        INSERT INTO orders (order_id, payment_id, product_id, amount_paid_rupees, platform_fee_rupees, merchant_share_rupees, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'paid')
-    """, (payload.razorpay_order_id, payload.razorpay_payment_id, payload.product_id, price, platform_cut, merchant_share))
-    conn.commit()
-    conn.close()
+        cursor.execute("""
+            INSERT INTO orders (order_id, payment_id, product_id, amount_paid_rupees, platform_fee_rupees, merchant_share_rupees, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'paid')
+        """, (payload.razorpay_order_id, payload.razorpay_payment_id, payload.product_id, price, platform_cut, merchant_share))
+        conn.commit()
 
     return {
         "success": True,
         "download_url": delivery_url
     }
+
 @app.get("/analytics/{slug}", response_class=HTMLResponse)
 def merchant_analytics(slug: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # 1. Store info
-    cursor.execute("SELECT id, store_name FROM merchants WHERE slug = ?", (slug.lower(),))
-    merchant = cursor.fetchone()
-    if not merchant:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Store not found")
-        
-    merchant_id, store_name = merchant
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, store_name FROM merchants WHERE slug = ?", (slug.lower(),))
+        merchant = cursor.fetchone()
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Store not found")
+            
+        merchant_id, store_name = merchant
 
-    # 2. Aggregated metrics
-    cursor.execute("""
-        SELECT 
-            COUNT(o.id),
-            COALESCE(SUM(o.amount_paid_rupees), 0),
-            COALESCE(SUM(o.merchant_share_rupees), 0),
-            COALESCE(SUM(o.platform_fee_rupees), 0)
-        FROM orders o
-        JOIN products p ON o.product_id = p.id
-        WHERE p.merchant_id = ? AND o.status = 'paid'
-    """, (merchant_id,))
-    total_orders, gross_rev, net_payout, total_fees = cursor.fetchone()
+        cursor.execute("""
+            SELECT 
+                COUNT(o.id),
+                COALESCE(SUM(o.amount_paid_rupees), 0),
+                COALESCE(SUM(o.merchant_share_rupees), 0),
+                COALESCE(SUM(o.platform_fee_rupees), 0)
+            FROM orders o
+            JOIN products p ON o.product_id = p.id
+            WHERE p.merchant_id = ? AND o.status = 'paid'
+        """, (merchant_id,))
+        total_orders, gross_rev, net_payout, total_fees = cursor.fetchone()
 
-    # 3. Recent Orders
-    cursor.execute("""
-        SELECT o.order_id, o.payment_id, p.title, o.amount_paid_rupees, o.merchant_share_rupees
-        FROM orders o
-        JOIN products p ON o.product_id = p.id
-        WHERE p.merchant_id = ? AND o.status = 'paid'
-        ORDER BY o.id DESC LIMIT 10
-    """, (merchant_id,))
-    recent_orders = cursor.fetchall()
-    conn.close()
+        cursor.execute("""
+            SELECT o.order_id, o.payment_id, p.title, o.amount_paid_rupees, o.merchant_share_rupees
+            FROM orders o
+            JOIN products p ON o.product_id = p.id
+            WHERE p.merchant_id = ? AND o.status = 'paid'
+            ORDER BY o.id DESC LIMIT 10
+        """, (merchant_id,))
+        recent_orders = cursor.fetchall()
 
     rows_html = "".join([
         f"<tr><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>₹{r[3]}</td><td style='color:#16a34a; font-weight:600;'>₹{r[4]}</td></tr>"
@@ -272,7 +300,7 @@ def merchant_analytics(slug: str):
     <!DOCTYPE html>
     <html>
     <head>
-        <title>{store_name} - Analytics</title>
+        <title>{store_name} Analytics</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; }}
             .container {{ max-width: 900px; margin: 0 auto; }}
@@ -289,7 +317,7 @@ def merchant_analytics(slug: str):
     </head>
     <body>
         <div class="container">
-            <h1>{store_name} • Sales Dashboard</h1>
+            <h1>{store_name} Sales Dashboard</h1>
             <div class="grid">
                 <div class="stat-card">
                     <div class="stat-title">Total Orders</div>
