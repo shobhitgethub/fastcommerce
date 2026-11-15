@@ -1,5 +1,4 @@
-﻿@'
-import os
+﻿import os
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -75,4 +74,3 @@ def init_db():
                     status TEXT DEFAULT 'paid'
                 );
             """))
-'@ | Out-File -FilePath db.py -Encoding utf8

@@ -1,5 +1,4 @@
-﻿@'
-import os
+﻿import os
 import razorpay
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -352,4 +351,3 @@ def merchant_analytics(slug: str):
     </body>
     </html>
     """
-'@ | Out-File -FilePath server.py -Encoding utf8
