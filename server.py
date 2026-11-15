@@ -1,11 +1,13 @@
-﻿import os
-import sqlite3
+﻿@'
+import os
 import razorpay
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from db import init_db
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from db import engine, init_db
 
 load_dotenv()
 
@@ -14,23 +16,20 @@ key_secret = os.getenv("RAZORPAY_KEY_SECRET", "")
 client = razorpay.Client(auth=(key_id, key_secret)) if (key_id and key_secret) else None
 
 app = FastAPI(title="FastCommerce Engine")
-DB_NAME = "commerce.db"
 
 def seed_default_store():
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM merchants WHERE slug = 'codecraft'")
-        if not cursor.fetchone():
-            cursor.execute(
-                "INSERT INTO merchants (store_name, slug, email, platform_fee_percent) VALUES (?, ?, ?, ?)",
-                ("CodeCraft Store", "codecraft", "support@codecraft.io", 5.0)
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT id FROM merchants WHERE slug = 'codecraft'")).fetchone()
+        if not row:
+            res = conn.execute(
+                text("INSERT INTO merchants (store_name, slug, email, platform_fee_percent) VALUES (:name, :slug, :email, :fee) RETURNING id"),
+                {"name": "CodeCraft Store", "slug": "codecraft", "email": "support@codecraft.io", "fee": 5.0}
             )
-            merchant_id = cursor.lastrowid
-            cursor.execute(
-                "INSERT INTO products (merchant_id, title, price_rupees, delivery_file_url) VALUES (?, ?, ?, ?)",
-                (merchant_id, "FastAPI Boilerplate Kit", 499, "https://github.com")
+            merchant_id = res.fetchone()[0]
+            conn.execute(
+                text("INSERT INTO products (merchant_id, title, price_rupees, delivery_file_url) VALUES (:mid, :title, :price, :url)"),
+                {"mid": merchant_id, "title": "FastAPI Boilerplate Kit", "price": 499, "url": "https://github.com"}
             )
-            conn.commit()
 
 @app.on_event("startup")
 def startup():
@@ -62,36 +61,32 @@ def merchant_dashboard():
 @app.post("/api/create-store")
 def create_store(payload: CreateStorePayload):
     try:
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO merchants (store_name, slug, email) VALUES (?, ?, ?)",
-                (payload.store_name, payload.slug.lower(), payload.email)
+        with engine.begin() as conn:
+            res = conn.execute(
+                text("INSERT INTO merchants (store_name, slug, email) VALUES (:name, :slug, :email) RETURNING id"),
+                {"name": payload.store_name, "slug": payload.slug.lower(), "email": payload.email}
             )
-            merchant_id = cursor.lastrowid
+            merchant_id = res.fetchone()[0]
 
-            cursor.execute(
-                "INSERT INTO products (merchant_id, title, price_rupees) VALUES (?, ?, ?)",
-                (merchant_id, payload.product_title, payload.price)
+            conn.execute(
+                text("INSERT INTO products (merchant_id, title, price_rupees) VALUES (:mid, :title, :price)"),
+                {"mid": merchant_id, "title": payload.product_title, "price": payload.price}
             )
-            conn.commit()
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         raise HTTPException(status_code=400, detail="Store URL slug already taken.")
     
     return {"store_url": f"/store/{payload.slug.lower()}"}
 
 @app.get("/store/{slug}", response_class=HTMLResponse)
 def get_store(slug: str):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
             SELECT m.store_name, p.id, p.title, p.price_rupees, m.platform_fee_percent
             FROM merchants m
             JOIN products p ON m.id = p.merchant_id
-            WHERE m.slug = ?
+            WHERE m.slug = :slug
             LIMIT 1
-        """, (slug.lower(),))
-        row = cursor.fetchone()
+        """), {"slug": slug.lower()}).fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail=f"Store '{slug}' not found.")
@@ -181,15 +176,13 @@ def create_dynamic_order(product_id: int):
     if not client:
         raise HTTPException(status_code=500, detail="Razorpay credentials not configured.")
 
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
             SELECT p.title, p.price_rupees, m.store_name, m.platform_fee_percent
             FROM products p
             JOIN merchants m ON p.merchant_id = m.id
-            WHERE p.id = ?
-        """, (product_id,))
-        row = cursor.fetchone()
+            WHERE p.id = :pid
+        """), {"pid": product_id}).fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -231,15 +224,13 @@ def verify_and_fulfill(payload: VerifyPaymentPayload):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid payment signature")
 
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    with engine.begin() as conn:
+        row = conn.execute(text("""
             SELECT p.price_rupees, COALESCE(p.delivery_file_url, 'https://github.com'), m.platform_fee_percent
             FROM products p
             JOIN merchants m ON p.merchant_id = m.id
-            WHERE p.id = ?
-        """, (payload.product_id,))
-        row = cursor.fetchone()
+            WHERE p.id = :pid
+        """), {"pid": payload.product_id}).fetchone()
 
         if not row:
             raise HTTPException(status_code=404, detail="Product not found")
@@ -248,11 +239,17 @@ def verify_and_fulfill(payload: VerifyPaymentPayload):
         platform_cut = round(price * (fee_percent / 100.0), 2)
         merchant_share = round(price - platform_cut, 2)
 
-        cursor.execute("""
+        conn.execute(text("""
             INSERT INTO orders (order_id, payment_id, product_id, amount_paid_rupees, platform_fee_rupees, merchant_share_rupees, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'paid')
-        """, (payload.razorpay_order_id, payload.razorpay_payment_id, payload.product_id, price, platform_cut, merchant_share))
-        conn.commit()
+            VALUES (:oid, :pid, :prod_id, :paid, :fee, :share, 'paid')
+        """), {
+            "oid": payload.razorpay_order_id,
+            "pid": payload.razorpay_payment_id,
+            "prod_id": payload.product_id,
+            "paid": price,
+            "fee": platform_cut,
+            "share": merchant_share
+        })
 
     return {
         "success": True,
@@ -261,16 +258,17 @@ def verify_and_fulfill(payload: VerifyPaymentPayload):
 
 @app.get("/analytics/{slug}", response_class=HTMLResponse)
 def merchant_analytics(slug: str):
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, store_name FROM merchants WHERE slug = ?", (slug.lower(),))
-        merchant = cursor.fetchone()
+    with engine.connect() as conn:
+        merchant = conn.execute(
+            text("SELECT id, store_name FROM merchants WHERE slug = :slug"),
+            {"slug": slug.lower()}
+        ).fetchone()
         if not merchant:
             raise HTTPException(status_code=404, detail="Store not found")
             
         merchant_id, store_name = merchant
 
-        cursor.execute("""
+        total_orders, gross_rev, net_payout, total_fees = conn.execute(text("""
             SELECT 
                 COUNT(o.id),
                 COALESCE(SUM(o.amount_paid_rupees), 0),
@@ -278,18 +276,16 @@ def merchant_analytics(slug: str):
                 COALESCE(SUM(o.platform_fee_rupees), 0)
             FROM orders o
             JOIN products p ON o.product_id = p.id
-            WHERE p.merchant_id = ? AND o.status = 'paid'
-        """, (merchant_id,))
-        total_orders, gross_rev, net_payout, total_fees = cursor.fetchone()
+            WHERE p.merchant_id = :mid AND o.status = 'paid'
+        """), {"mid": merchant_id}).fetchone()
 
-        cursor.execute("""
+        recent_orders = conn.execute(text("""
             SELECT o.order_id, o.payment_id, p.title, o.amount_paid_rupees, o.merchant_share_rupees
             FROM orders o
             JOIN products p ON o.product_id = p.id
-            WHERE p.merchant_id = ? AND o.status = 'paid'
+            WHERE p.merchant_id = :mid AND o.status = 'paid'
             ORDER BY o.id DESC LIMIT 10
-        """, (merchant_id,))
-        recent_orders = cursor.fetchall()
+        """), {"mid": merchant_id}).fetchall()
 
     rows_html = "".join([
         f"<tr><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>₹{r[3]}</td><td style='color:#16a34a; font-weight:600;'>₹{r[4]}</td></tr>"
@@ -356,3 +352,4 @@ def merchant_analytics(slug: str):
     </body>
     </html>
     """
+'@ | Out-File -FilePath server.py -Encoding utf8
